@@ -3,9 +3,8 @@ bot.py - Universal Web Page PNG Archiver & Interactive Browser Telegram Bot
 
 Powered by a lightweight Pure-Python Async Native CDP Engine (zero Playwright!):
 - Captures ANY web page (full page, lossless HiDPI PNG documents, cleanly sliced if tall).
-- Preserves dedicated 4chan Yotsuba B thread archiving with reload & live interactive launch.
 - Full interactive browsing directly inside Telegram:
-  * Reload page (/atualizar, /reload, or button)
+  * Reload page (/u or button)
   * Interactive Click Mode with numbered color-coded DOM badges (click by button, number,
     "N texto" combo, visible text typed in chat, CSS selector, or x,y coordinates)
   * Direct Chat-to-Page Typing Mode (anything written in chat is typed into the focused field)
@@ -48,11 +47,7 @@ from telegram.ext import (
 
 from cdp_engine import CDPBrowser, CDPError, InteractiveElement, NavigationError
 from renderer import (
-    FOURCHAN_URL_REGEX,
-    FourChanAPIError,
     InvalidURLError,
-    ThreadNotFoundError,
-    ThreadRenderer,
     WebPageRenderer,
     extract_and_normalize_url,
 )
@@ -86,7 +81,6 @@ ALLOWED_USER_IDS: Optional[Set[int]] = (
 
 # Shared engine & service instances
 cdp_browser: Optional[CDPBrowser] = None
-thread_renderer: Optional[ThreadRenderer] = None
 web_renderer: Optional[WebPageRenderer] = None
 session_manager: Optional[SessionManager] = None
 
@@ -106,12 +100,10 @@ def _is_authorized(update: Update) -> bool:
 
 
 def _ensure_services() -> None:
-    """Lazily initializes shared CDP browser, renderers, and session manager."""
-    global cdp_browser, thread_renderer, web_renderer, session_manager
+    """Lazily initializes shared CDP browser, renderer, and session manager."""
+    global cdp_browser, web_renderer, session_manager
     if cdp_browser is None:
         cdp_browser = CDPBrowser()
-    if thread_renderer is None:
-        thread_renderer = ThreadRenderer(browser=cdp_browser)
     if web_renderer is None:
         web_renderer = WebPageRenderer(browser=cdp_browser)
     if session_manager is None:
@@ -130,17 +122,17 @@ async def post_init(application: Application) -> None:
             [
                 BotCommand("start", "Iniciar e ver opções rápidas"),
                 BotCommand("png", "Extrair página completa em PNG [url]"),
-                BotCommand("interativo", "Abrir navegador interativo [url]"),
-                BotCommand("pesquisar", "Modo interativo de pesquisa na web [termo]"),
-                BotCommand("atualizar", "Atualizar a página ou thread atual"),
-                BotCommand("clicar", "Clicar em elemento (nº, texto, seletor ou x,y)"),
-                BotCommand("digitar", "Digitar texto no campo focado [nº] <texto>"),
-                BotCommand("achar", "Pesquisar texto dentro da página atual [termo]"),
-                BotCommand("voltar", "Voltar para a página anterior"),
-                BotCommand("avancar", "Avançar no histórico"),
-                BotCommand("rolar", "Rolar página (cima/baixo/topo/fim)"),
-                BotCommand("fechar", "Fechar sessão interativa e liberar RAM"),
-                BotCommand("ajuda", "Ver guia completo de uso"),
+                BotCommand("i", "Abrir navegador interativo [url]"),
+                BotCommand("s", "Pesquisar na web [termo]"),
+                BotCommand("f", "Achar texto na página [termo]"),
+                BotCommand("t", "Digitar no campo [nº] <texto>"),
+                BotCommand("c", "Clicar em elemento (nº, texto, seletor ou x,y)"),
+                BotCommand("u", "Atualizar a página atual"),
+                BotCommand("b", "Voltar no histórico"),
+                BotCommand("n", "Avançar no histórico"),
+                BotCommand("r", "Rolar página (cima/baixo/topo/fim)"),
+                BotCommand("exit", "Fechar sessão interativa e liberar RAM"),
+                BotCommand("help", "Ver guia de uso"),
             ]
         )
     except Exception as exc:
@@ -148,15 +140,12 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    """Gracefully closes all interactive sessions, HTTP clients, and the CDP browser."""
-    global cdp_browser, thread_renderer, web_renderer, session_manager
+    """Gracefully closes all interactive sessions and the CDP browser."""
+    global cdp_browser, web_renderer, session_manager
     logger.info("Shutting down sessions and native CDP browser...")
     if session_manager:
         await session_manager.close_all()
         session_manager = None
-    if thread_renderer:
-        await thread_renderer.close()
-        thread_renderer = None
     if web_renderer:
         await web_renderer.close()
         web_renderer = None
@@ -170,10 +159,11 @@ async def post_shutdown(application: Application) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _short_url(url: str, max_len: int = 62) -> str:
-    if len(url) <= max_len:
-        return url
-    return url[: max_len - 3] + "..."
+def _short_url(url: str, max_len: int = 58) -> str:
+    clean = re.sub(r"^https?://", "", url).rstrip("/")
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1] + "…"
 
 
 def _kind_icon(el: InteractiveElement) -> str:
@@ -184,100 +174,90 @@ def _kind_icon(el: InteractiveElement) -> str:
     return "🔵"
 
 
-def build_web_capture_keyboard() -> InlineKeyboardMarkup:
-    """Buttons shown beneath a delivered full-page website PNG."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🔄 Atualizar", callback_data="act:reload_web"),
-                InlineKeyboardButton("🖱️ Modo Interativo", callback_data="act:open_interactive"),
-            ],
-            [
-                InlineKeyboardButton("🔎 Achar na Página", callback_data="act:mode_find"),
-                InlineKeyboardButton("🔍 Pesquisar Web", callback_data="act:mode_search"),
-            ],
-        ]
+def _search_engines_legend() -> str:
+    return " · ".join(f"{meta['emoji']} {meta['name']}" for meta in SEARCH_ENGINES.values())
+
+
+def _build_search_prompt_text(active_engine: str) -> str:
+    eng = SEARCH_ENGINES.get(active_engine, SEARCH_ENGINES["duckduckgo"])
+    return (
+        f"🔍 <b>Pesquisa Web</b> · {eng['emoji']} <b>{eng['name']}</b>\n"
+        f"<i>{_search_engines_legend()}</i>\n\n"
+        "Escreva o que deseja buscar no chat:"
     )
 
 
-def build_4chan_capture_keyboard() -> InlineKeyboardMarkup:
-    """Buttons shown beneath a delivered 4chan Yotsuba B thread PNG."""
+def build_web_capture_keyboard() -> InlineKeyboardMarkup:
+    """Compact emoji controls beneath a delivered full-page website PNG."""
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔄 Atualizar Thread", callback_data="act:reload_4chan"),
-                InlineKeyboardButton("🌐 Abrir Interativo", callback_data="act:open_4chan_live"),
-            ],
-            [
-                InlineKeyboardButton("🔍 Pesquisar Web", callback_data="act:mode_search"),
-            ],
+                InlineKeyboardButton("🔄", callback_data="act:reload_web"),
+                InlineKeyboardButton("🖱️", callback_data="act:open_interactive"),
+                InlineKeyboardButton("🔦", callback_data="act:mode_find"),
+                InlineKeyboardButton("🔍", callback_data="act:mode_search"),
+            ]
         ]
     )
 
 
 def build_search_prompt_keyboard(active_engine: str) -> InlineKeyboardMarkup:
-    """Inline keyboard allowing quick search engine selection."""
-    row1 = []
-    row2 = []
-    for idx, (key, meta) in enumerate(SEARCH_ENGINES.items()):
-        mark = "• " if key == active_engine else ""
-        btn = InlineKeyboardButton(f"{mark}{meta['emoji']} {meta['name']}", callback_data=f"act:engine:{key}")
-        (row1 if idx < 3 else row2).append(btn)
-    rows = [row1]
-    if row2:
-        rows.append(row2)
-    rows.append([InlineKeyboardButton("❌ Cancelar", callback_data="act:mode_click")])
-    return InlineKeyboardMarkup(rows)
+    """Compact emoji keyboard for quick search engine selection."""
+    eng_row = [
+        InlineKeyboardButton(
+            f"• {meta['emoji']}" if key == active_engine else meta["emoji"],
+            callback_data=f"act:engine:{key}",
+        )
+        for key, meta in SEARCH_ENGINES.items()
+    ]
+    return InlineKeyboardMarkup(
+        [
+            eng_row,
+            [InlineKeyboardButton("❌", callback_data="act:mode_click")],
+        ]
+    )
 
 
 def build_interactive_keyboard(session: BrowserSession) -> InlineKeyboardMarkup:
-    """Builds the rich interactive mini-browser keyboard for the current session state."""
+    """Builds a sleek, emoji-first interactive mini-browser keyboard."""
     rows: List[List[InlineKeyboardButton]] = []
 
     # 1. Context-specific top strip
     if session.mode == SessionMode.TYPE:
-        auto_lbl = "↵ Auto-Enter: ON" if session.auto_enter else "↵ Auto-Enter: OFF"
+        auto_lbl = "⏎🟢" if session.auto_enter else "⏎⚪"
         rows.append(
             [
-                InlineKeyboardButton("↵ Enter", callback_data="act:key:Enter"),
-                InlineKeyboardButton("🧹 Limpar", callback_data="act:clear_input"),
-                InlineKeyboardButton("⇥ Tab", callback_data="act:key:Tab"),
-                InlineKeyboardButton("⎋ Esc", callback_data="act:key:Escape"),
-            ]
-        )
-        rows.append(
-            [
+                InlineKeyboardButton("⏎", callback_data="act:key:Enter"),
+                InlineKeyboardButton("🧹", callback_data="act:clear_input"),
+                InlineKeyboardButton("⇥", callback_data="act:key:Tab"),
+                InlineKeyboardButton("⎋", callback_data="act:key:Escape"),
                 InlineKeyboardButton(auto_lbl, callback_data="act:auto_enter"),
-                InlineKeyboardButton("🖱️ Voltar p/ Clique", callback_data="act:mode_click"),
             ]
         )
     elif session.mode == SessionMode.WEB_SEARCH:
-        eng_row1 = []
-        eng_row2 = []
-        for idx, (key, meta) in enumerate(SEARCH_ENGINES.items()):
-            mark = "✓ " if key == session.search_engine else ""
-            btn = InlineKeyboardButton(
-                f"{mark}{meta['emoji']} {meta['name']}",
-                callback_data=f"act:engine:{key}",
-            )
-            (eng_row1 if idx < 3 else eng_row2).append(btn)
-        rows.append(eng_row1)
-        if eng_row2:
-            rows.append(eng_row2)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"• {meta['emoji']}" if key == session.search_engine else meta["emoji"],
+                    callback_data=f"act:engine:{key}",
+                )
+                for key, meta in SEARCH_ENGINES.items()
+            ]
+        )
     elif session.mode == SessionMode.PAGE_FIND or session.find_total > 0:
         rows.append(
             [
-                InlineKeyboardButton("◀️ Anterior", callback_data="act:find_prev"),
+                InlineKeyboardButton("◀️", callback_data="act:find_prev"),
                 InlineKeyboardButton(
-                    f"🔎 {session.find_index}/{session.find_total}" if session.find_total else "🔎 Nova Busca",
+                    f"🔦 {session.find_index}/{session.find_total}" if session.find_total else "🔦",
                     callback_data="act:mode_find",
                 ),
-                InlineKeyboardButton("▶️ Próximo", callback_data="act:find_next"),
+                InlineKeyboardButton("▶️", callback_data="act:find_next"),
                 InlineKeyboardButton("🧹", callback_data="act:find_clear"),
             ]
         )
 
-    # 2. Quick clickable numbered buttons (paginated 10 per page) when elements exist
+    # 2. Color-coded numbered clickable positions (paginated 10 per page)
     if session.elements and session.mode != SessionMode.TYPE:
         total = len(session.elements)
         max_page = max(0, (total - 1) // BADGES_PER_PAGE)
@@ -298,15 +278,15 @@ def build_interactive_keyboard(session: BrowserSession) -> InlineKeyboardMarkup:
         if max_page > 0:
             nav_badges = []
             if page_idx > 0:
-                nav_badges.append(InlineKeyboardButton("◀️ Tags", callback_data=f"act:bpage:{page_idx - 1}"))
+                nav_badges.append(InlineKeyboardButton("◀️", callback_data=f"act:bpage:{page_idx - 1}"))
             nav_badges.append(
                 InlineKeyboardButton(
-                    f"Itens {start + 1}-{start + len(chunk)}/{total}",
+                    f"{start + 1}–{start + len(chunk)} / {total}",
                     callback_data="act:noop",
                 )
             )
             if page_idx < max_page:
-                nav_badges.append(InlineKeyboardButton("Tags ▶️", callback_data=f"act:bpage:{page_idx + 1}"))
+                nav_badges.append(InlineKeyboardButton("▶️", callback_data=f"act:bpage:{page_idx + 1}"))
             rows.append(nav_badges)
 
     # 3. Browser navigation strip
@@ -320,26 +300,29 @@ def build_interactive_keyboard(session: BrowserSession) -> InlineKeyboardMarkup:
         ]
     )
 
-    # 4. Mode switcher strip
-    click_lbl = "• 🖱️ Clique" if session.mode == SessionMode.CLICK else "🖱️ Clique"
-    type_lbl = "• ⌨️ Digitar" if session.mode == SessionMode.TYPE else "⌨️ Digitar"
-    search_lbl = "• 🔍 Pesquisar" if session.mode == SessionMode.WEB_SEARCH else "🔍 Pesquisar"
-    find_lbl = "• 🔎 Na Página" if session.mode == SessionMode.PAGE_FIND else "🔎 Na Página"
+    # 4. Mode switcher strip (single 🖱️/⌨️ toggle button + 🔍 + 🔦)
+    if session.mode == SessionMode.TYPE:
+        click_type_lbl = "• ⌨️"
+    elif session.mode == SessionMode.CLICK:
+        click_type_lbl = "• 🖱️"
+    else:
+        click_type_lbl = "🖱️"
+    search_lbl = "• 🔍" if session.mode == SessionMode.WEB_SEARCH else "🔍"
+    find_lbl = "• 🔦" if session.mode == SessionMode.PAGE_FIND else "🔦"
     rows.append(
         [
-            InlineKeyboardButton(click_lbl, callback_data="act:mode_click"),
-            InlineKeyboardButton(type_lbl, callback_data="act:mode_type"),
+            InlineKeyboardButton(click_type_lbl, callback_data="act:toggle_click_type"),
             InlineKeyboardButton(search_lbl, callback_data="act:mode_search"),
             InlineKeyboardButton(find_lbl, callback_data="act:mode_find"),
         ]
     )
 
-    # 5. Export & session controls
-    tags_lbl = "🏷️ Tags: ON" if session.show_tags else "🏷️ Tags: OFF"
+    # 5. Export & session controls (pure emojis)
+    tags_lbl = "🏷️🟢" if session.show_tags else "🏷️⚪"
     rows.append(
         [
-            InlineKeyboardButton("📄 PNG Completo", callback_data="act:full_png"),
-            InlineKeyboardButton("🖼️ PNG Tela", callback_data="act:vp_png"),
+            InlineKeyboardButton("📄", callback_data="act:full_png"),
+            InlineKeyboardButton("🖼️", callback_data="act:vp_png"),
             InlineKeyboardButton(tags_lbl, callback_data="act:tags"),
             InlineKeyboardButton("❌", callback_data="act:close"),
         ]
@@ -349,58 +332,33 @@ def build_interactive_keyboard(session: BrowserSession) -> InlineKeyboardMarkup:
 
 
 def build_interactive_caption(session: BrowserSession, snap: InteractiveSnapshot) -> str:
-    """Builds a concise, HTML-escaped caption <= 1000 chars for the interactive screenshot."""
-    mode_titles = {
-        SessionMode.CLICK: "🖱️ MODO CLIQUE",
-        SessionMode.TYPE: "⌨️ MODO DIGITAÇÃO",
-        SessionMode.WEB_SEARCH: "🔍 MODO PESQUISA",
-        SessionMode.PAGE_FIND: "🔎 BUSCA NA PÁGINA",
-        SessionMode.IDLE: "🌐 NAVEGADOR",
+    """Builds a minimal, HTML-safe caption for the interactive screenshot."""
+    eng = SEARCH_ENGINES.get(session.search_engine, SEARCH_ENGINES["duckduckgo"])
+    mode_badges = {
+        SessionMode.CLICK: "🖱️",
+        SessionMode.TYPE: "⌨️",
+        SessionMode.WEB_SEARCH: f"🔍 {eng['emoji']} {eng['name']}",
+        SessionMode.PAGE_FIND: "🔦",
+        SessionMode.IDLE: "🌐",
     }
-    header = f"<b>{mode_titles.get(session.mode, '🌐 NAVEGADOR')}</b> · Rolagem: {snap.scroll.percent}%"
-    title_clean = html.escape((snap.title or "Sem título")[:65])
-    url_clean = html.escape(_short_url(snap.url, 68))
+    mode_badge = mode_badges.get(session.mode, "🌐")
+    title_clean = html.escape((snap.title or "Sem título")[:64])
+    url_clean = html.escape(_short_url(snap.url, 56))
 
-    lines = [header, f"<b>{title_clean}</b>", f"<code>{url_clean}</code>"]
+    lines = [
+        f"<b>{title_clean}</b>",
+        f"{mode_badge}  ·  ↕️ {snap.scroll.percent}%  ·  <code>{url_clean}</code>",
+    ]
 
     if snap.status_note:
-        lines.append(f"ℹ️ {html.escape(snap.status_note[:140])}")
+        lines.append(f"› <i>{html.escape(snap.status_note[:120])}</i>")
 
     if session.find_total > 0 and session.find_query:
         lines.append(
-            f"🔎 <b>{html.escape(session.find_query[:30])}</b>: "
-            f"ocorrência {session.find_index}/{session.find_total}"
+            f"🔦 <b>{html.escape(session.find_query[:28])}</b> · {session.find_index}/{session.find_total}"
         )
 
-    # Compact legend for current page of badges
-    if snap.elements and session.show_tags:
-        start = session.badge_page * BADGES_PER_PAGE
-        chunk = snap.elements[start : start + BADGES_PER_PAGE]
-        if chunk:
-            legend_parts = []
-            for el in chunk[:8]:
-                lbl = html.escape(el.label[:26])
-                legend_parts.append(f"{_kind_icon(el)}<b>[{el.id}]</b> {lbl}")
-            lines.append("\n" + "  ".join(legend_parts[:4]))
-            if len(legend_parts) > 4:
-                lines.append("  ".join(legend_parts[4:]))
-
-    # Mode guidance hint
-    if session.mode == SessionMode.TYPE:
-        enter_state = "ON" if session.auto_enter else "OFF"
-        lines.append(f"\n💡 <i>O que você escrever no chat será digitado no campo focado (Auto-Enter: {enter_state}).</i>")
-    elif session.mode == SessionMode.WEB_SEARCH:
-        eng = SEARCH_ENGINES.get(session.search_engine, SEARCH_ENGINES["duckduckgo"])
-        lines.append(f"\n💡 <i>Digite no chat para pesquisar no {eng['emoji']} {eng['name']} ou clique em um número.</i>")
-    elif session.mode == SessionMode.PAGE_FIND:
-        lines.append("\n💡 <i>Digite no chat o termo que deseja destacar dentro desta página.</i>")
-    else:
-        lines.append("\n💡 <i>Toque um botão ou digite no chat: nº (ex: <code>3</code>), <code>1 termo</code>, texto do botão ou URL.</i>")
-
-    caption = "\n".join(lines)
-    if len(caption) > 1000:
-        caption = caption[:995] + "..."
-    return caption
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -430,75 +388,6 @@ async def send_png_documents(
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup if is_last else None,
-            )
-
-
-async def capture_and_send_4chan(
-    target_msg: Message,
-    session: BrowserSession,
-    board: str,
-    thread_id: int,
-) -> None:
-    """Renders a 4chan thread in Yotsuba B PNG and sends it with reload + live browser buttons."""
-    _ensure_services()
-    assert thread_renderer is not None
-
-    status_msg = await target_msg.reply_text(
-        f"🍀 <b>Capturando thread do 4chan</b> <code>/{html.escape(board)}/{thread_id}</code>...\n"
-        "<i>Renderizando em PNG HiDPI (tema Yotsuba B) via motor CDP leve.</i>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    session.last_4chan = (board, thread_id)
-    session.last_url = f"https://boards.4chan.org/{board}/thread/{thread_id}"
-    session.touch()
-
-    with tempfile.TemporaryDirectory(prefix=f"4chan_{board}_{thread_id}_") as temp_dir:
-        try:
-            await target_msg.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            image_paths = await thread_renderer.render_thread_to_images(
-                board=board,
-                thread_id=thread_id,
-                output_dir=Path(temp_dir),
-            )
-            if not image_paths:
-                await status_msg.edit_text("❌ Falha ao gerar o PNG da thread.", parse_mode=ParseMode.HTML)
-                return
-
-            if len(image_paths) > 1:
-                await status_msg.edit_text(
-                    f"📦 <b>Thread longa!</b> Dividida sem cortar posts em {len(image_paths)} partes PNG.\n"
-                    "Enviando documentos sem compressão...",
-                    parse_mode=ParseMode.HTML,
-                )
-
-            base_caption = f"🍀 <b>4chan</b> <code>/{html.escape(board)}/{thread_id}</code> (Yotsuba B · PNG)"
-            await send_png_documents(
-                bot_message_target=target_msg,
-                image_paths=image_paths,
-                base_caption_html=base_caption,
-                reply_markup=build_4chan_capture_keyboard(),
-            )
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-        except ThreadNotFoundError:
-            await status_msg.edit_text(
-                f"❌ <b>Thread não encontrada (404)</b>\n"
-                f"A thread <code>/{html.escape(board)}/{thread_id}</code> pode ter sido arquivada ou removida.",
-                parse_mode=ParseMode.HTML,
-            )
-        except FourChanAPIError as api_err:
-            await status_msg.edit_text(
-                f"⚠️ <b>Erro na API do 4chan:</b>\n<code>{html.escape(str(api_err))}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as exc:
-            logger.exception(f"Unexpected error rendering /{board}/{thread_id}: {exc}")
-            await status_msg.edit_text(
-                f"⚠️ <b>Erro ao renderizar thread:</b>\n<code>{html.escape(str(exc))}</code>",
-                parse_mode=ParseMode.HTML,
             )
 
 
@@ -542,7 +431,6 @@ async def capture_and_send_full_web_png(
                 )
                 session.last_url = final_url
                 session.last_title = title
-                session.last_4chan = None
                 session.touch()
 
             if not image_paths:
@@ -641,25 +529,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     welcome = (
-        "🌐 <b>WebArc Bot — Extrator PNG & Navegador Interativo</b>\n\n"
-        "Capture <b>qualquer site inteiro em PNG sem compressão</b> (inclusive threads do 4chan no tema Yotsuba B) "
-        "e interaja com páginas diretamente pelo Telegram!\n\n"
-        "✨ <b>O que você pode fazer:</b>\n"
-        "• <b>Envie qualquer URL</b> → extrai toda a página em PNG HiDPI.\n"
-        "• <b>🔄 Atualizar</b> → recarrega a página ou thread atual a qualquer momento.\n"
-        "• <b>🖱️ Modo Interativo</b> (<code>/interativo [url]</code>) → clica por número, botão ou texto escrito no chat.\n"
-        "• <b>⌨️ Modo Digitação</b> (<code>/digitar</code>) → tudo que escrever no chat é digitado direto no campo da página.\n"
-        "• <b>🔍 Modo Pesquisa</b> (<code>/pesquisar [termo]</code>) → pesquisa interativa na Web (DuckDuckGo, Google, Wikipédia, Bing, YouTube) ou dentro da página (<code>/achar</code>).\n\n"
-        "📌 <b>Exemplos:</b>\n"
-        "<code>https://news.ycombinator.com</code>\n"
-        "<code>/pesquisar python asyncio</code>\n"
-        "<code>/interativo wikipedia.org</code>"
+        "🌐 <b>WebArc</b>\n"
+        "<i>PNG completo de qualquer página &amp; navegador interativo no Telegram</i>\n\n"
+        "• Envie uma <b>URL</b> → PNG completo sem compressão\n"
+        "• <code>/i [url]</code> → abre navegador ao vivo\n"
+        "• <code>/s [termo]</code> → busca na web\n\n"
+        "<i>Toque 🔍 para pesquisar ou 📖 para ver todos os comandos e botões.</i>"
     )
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔍 Iniciar Pesquisa Interativa", callback_data="act:mode_search"),
-                InlineKeyboardButton("📖 Guia Completo", callback_data="act:help"),
+                InlineKeyboardButton("🔍", callback_data="act:mode_search"),
+                InlineKeyboardButton("📖", callback_data="act:help"),
             ]
         ]
     )
@@ -674,27 +555,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def _build_help_text() -> str:
     return (
-        "📖 <b>Guia Completo — WebArc Bot</b>\n\n"
-        "<b>1. Extração de Página Completa em PNG</b>\n"
-        "• Cole qualquer link (ex: <code>g1.globo.com</code> ou <code>https://exemplo.com</code>).\n"
-        "• Use <code>/png [url]</code> para extrair a página inteira (ou a página atualmente aberta) em <b>PNG sem compressão</b>.\n"
-        "• Páginas muito longas são fatiadas automaticamente sem cortar blocos/posts.\n"
-        "• Links do 4chan continuam sendo arquivados no layout clássico <i>Yotsuba B</i>.\n\n"
-        "<b>2. Modo Interativo para Clicar</b>\n"
-        "• Use <code>/interativo [url]</code> ou toque em <b>🖱️ Modo Interativo</b>.\n"
-        "• Elementos visíveis recebem badges coloridos: 🔵 Links · 🟢 Botões · 🟠 Campos de texto.\n"
-        "• <b>Para clicar:</b> toque o botão numerado, envie só o número (<code>5</code>), envie <code>1 texto</code> para preencher+Enter, ou escreva o texto visível do botão no chat! Também aceita <code>/clicar #seletor</code> ou <code>/clicar 400,250</code>.\n\n"
-        "<b>3. Digitar o que for escrito no chat</b>\n"
-        "• Ao clicar num campo 🟠, o bot entra automaticamente em <b>⌨️ Modo Digitação</b> (ou use <code>/digitar</code>).\n"
-        "• Tudo que você escrever no chat será digitado no campo focado (com Auto-Enter configurável).\n"
-        "• Atalho direto: <code>/digitar [nº] seu texto aqui</code>.\n\n"
-        "<b>4. Modo Interativo de Pesquisa</b>\n"
-        "• <b>Web:</b> <code>/pesquisar [termo]</code> — escolha DuckDuckGo, Google, Wikipédia, Bing ou YouTube e navegue nos resultados clicando nos números.\n"
-        "• <b>Na Página:</b> <code>/achar [termo]</code> — destaca todas as ocorrências na página atual com navegação Anterior/Próximo.\n\n"
-        "<b>5. Navegação & Controle</b>\n"
-        "• <code>/atualizar</code> — recarrega a página atual.\n"
-        "• <code>/voltar</code> / <code>/avancar</code> / <code>/rolar [cima|baixo|topo|fim]</code>.\n"
-        "• <code>/fechar</code> — encerra a aba interativa para economizar RAM."
+        "📖 <b>WebArc — Ajuda</b>\n\n"
+        "<b>No chat</b>\n"
+        "<code>URL</code> — captura a página inteira em PNG\n"
+        "<code>5</code> — clica no item numerado (modo 🖱️)\n"
+        "<code>1 termo</code> — preenche o campo e envia Enter\n"
+        "<code>texto</code> — clica por texto (🖱️) ou digita (⌨️)\n\n"
+        "<b>Comandos</b>\n"
+        "<code>/png [url]</code> — PNG completo sem compressão\n"
+        "<code>/i [url]</code> — abre navegador ao vivo\n"
+        "<code>/s [termo]</code> — busca na web\n"
+        "<code>/f [termo]</code> — destaca texto na página\n"
+        "<code>/c [alvo]</code> — clica (nº, texto, <code>#seletor</code> ou <code>x,y</code>)\n"
+        "<code>/t [nº] texto</code> — digita direto na página\n"
+        "<code>/u</code> atualizar · <code>/b</code> voltar · <code>/n</code> avançar\n"
+        "<code>/r [cima|baixo|topo|fim]</code> rolar · <code>/exit</code> fechar\n\n"
+        "<b>Botões</b>\n"
+        "🔵 Link · 🟢 Botão · 🟠 Campo\n"
+        "🖱️/⌨️ Alterna Clique e Digitação\n"
+        "🔍 Busca Web · 🔦 Achar na página\n"
+        "⬅️ 🔄 ➡️ ⬆️ ⬇️ Navegação e rolagem\n"
+        "📄 PNG inteiro · 🖼️ PNG tela · 🏷️ Tags · ❌ Fechar\n"
+        "<i>No ⌨️:</i> ⏎ Enter · 🧹 Limpar · ⇥ Tab · ⎋ Esc · ⏎🟢/⚪ Auto-Enter"
     )
 
 
@@ -711,15 +593,6 @@ async def png_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with session.lock:
         if arg:
-            fc = FOURCHAN_URL_REGEX.search(arg)
-            if fc:
-                await capture_and_send_4chan(
-                    update.message,
-                    session,
-                    fc.group("board").lower(),
-                    int(fc.group("thread_id")),
-                )
-                return
             try:
                 url = extract_and_normalize_url(arg)
             except InvalidURLError as err:
@@ -734,9 +607,6 @@ async def png_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await capture_and_send_full_web_png(update.message, session, url=url, from_active_page=False)
         elif session.has_open_page:
             await capture_and_send_full_web_png(update.message, session, from_active_page=True)
-        elif session.last_4chan:
-            board, tid = session.last_4chan
-            await capture_and_send_4chan(update.message, session, board, tid)
         elif session.last_url:
             await capture_and_send_full_web_png(update.message, session, url=session.last_url)
         else:
@@ -783,8 +653,8 @@ async def interactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text(
                 "🖱️ Informe uma URL ou termo para abrir no modo interativo:\n"
-                "<code>/interativo https://news.ycombinator.com</code>\n"
-                "ou <code>/pesquisar algo</code>",
+                "<code>/i https://news.ycombinator.com</code>\n"
+                "ou <code>/s algo</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -809,7 +679,7 @@ async def interactive_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reloads the active interactive page, last webpage PNG, or last 4chan thread."""
+    """Reloads the active interactive page or last webpage PNG."""
     if not _is_authorized(update) or not update.message:
         return
     _ensure_services()
@@ -833,14 +703,11 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"❌ Erro ao atualizar: <code>{html.escape(str(exc))}</code>",
                     parse_mode=ParseMode.HTML,
                 )
-        elif session.last_4chan:
-            board, tid = session.last_4chan
-            await capture_and_send_4chan(update.message, session, board, tid)
         elif session.last_url:
             await capture_and_send_full_web_png(update.message, session, url=session.last_url)
         else:
             await update.message.reply_text(
-                "ℹ️ Nenhuma página ou thread foi carregada ainda para atualizar.",
+                "ℹ️ Nenhuma página foi carregada ainda para atualizar.",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -859,11 +726,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with session.lock:
         if not query:
             session.mode = SessionMode.WEB_SEARCH
-            eng = SEARCH_ENGINES.get(session.search_engine, SEARCH_ENGINES["duckduckgo"])
             await update.message.reply_text(
-                f"🔍 <b>Modo Interativo de Pesquisa ativado!</b>\n\n"
-                f"Buscador atual: <b>{eng['emoji']} {eng['name']}</b>\n"
-                "Escreva o que deseja pesquisar diretamente no chat (ou troque o buscador abaixo):",
+                _build_search_prompt_text(session.search_engine),
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_search_prompt_keyboard(session.search_engine),
             )
@@ -912,7 +776,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     async with session.lock:
         if not session.has_open_page and not session.last_url:
             await update.message.reply_text(
-                "ℹ️ Abra uma página primeiro (envie uma URL ou use <code>/pesquisar</code>) para pesquisar dentro dela.",
+                "ℹ️ Abra uma página primeiro (envie uma URL ou use <code>/s</code>) para pesquisar dentro dela.",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -956,7 +820,7 @@ async def click_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await session.navigate(session.last_url)
             else:
                 await update.message.reply_text(
-                    "ℹ️ Nenhuma página aberta. Use <code>/interativo URL</code> primeiro.",
+                    "ℹ️ Nenhuma página aberta. Use <code>/i URL</code> primeiro.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -997,17 +861,15 @@ async def _perform_click_argument(
         kb = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("⌨️ Digitar isso na página", callback_data="act:quick_type"),
-                    InlineKeyboardButton("🔎 Achar na página", callback_data="act:quick_find"),
-                ],
-                [
-                    InlineKeyboardButton("🔍 Pesquisar na Web", callback_data="act:quick_search"),
-                ],
+                    InlineKeyboardButton("⌨️", callback_data="act:quick_type"),
+                    InlineKeyboardButton("🔦", callback_data="act:quick_find"),
+                    InlineKeyboardButton("🔍", callback_data="act:quick_search"),
+                ]
             ]
         )
         await target_msg.reply_text(
             f"⚠️ {html.escape(res.message)}\n"
-            "O que deseja fazer com o texto enviado?",
+            "<i>⌨️ digitar · 🔦 achar na página · 🔍 pesquisar na web</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
@@ -1047,7 +909,7 @@ async def type_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await session.navigate(session.last_url)
             else:
                 await update.message.reply_text(
-                    "ℹ️ Abra uma página primeiro com <code>/interativo URL</code>.",
+                    "ℹ️ Abra uma página primeiro com <code>/i URL</code>.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -1061,7 +923,7 @@ async def type_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        # Support `/digitar 3 texto` or `/digitar texto`
+        # Support `/t 3 texto` or `/t texto`
         combo = NUMBER_AND_TEXT_RE.match(arg)
         element_id: Optional[int] = None
         text_to_type = arg
@@ -1177,20 +1039,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     session = await session_manager.get_session(chat_id)
 
-    # 1. Always check if the message is a 4chan thread URL (unless actively typing into an input)
-    if session.mode != SessionMode.TYPE:
-        fc_match = FOURCHAN_URL_REGEX.search(text)
-        if fc_match:
-            async with session.lock:
-                await capture_and_send_4chan(
-                    update.message,
-                    session,
-                    fc_match.group("board").lower(),
-                    int(fc_match.group("thread_id")),
-                )
-            return
-
-    # 2. Check if the message is ANY web URL (unless in TYPE / PAGE_FIND mode)
+    # 1. Check if the message is ANY web URL (unless in TYPE / PAGE_FIND mode)
     if session.mode not in (SessionMode.TYPE, SessionMode.PAGE_FIND):
         try:
             url = extract_and_normalize_url(text)
@@ -1280,20 +1129,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         kb = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        f"🔍 Pesquisar no {eng['emoji']} {eng['name']}",
-                        callback_data="act:quick_search",
-                    )
-                ],
-                [
-                    InlineKeyboardButton("📖 Ajuda", callback_data="act:help"),
-                ],
+                    InlineKeyboardButton(f"🔍 {eng['emoji']}", callback_data="act:quick_search"),
+                    InlineKeyboardButton("📖", callback_data="act:help"),
+                ]
             ]
         )
         await update.message.reply_text(
-            f"💬 Recebi: <i>{html.escape(text[:120])}</i>\n\n"
-            "Envie qualquer <b>URL</b> para extrair a página inteira em PNG, "
-            "ou toque abaixo para pesquisar este termo no modo interativo:",
+            f"💬 <i>{html.escape(text[:120])}</i>\n\n"
+            f"Envie uma <b>URL</b> para capturar em PNG ou toque 🔍 ({eng['name']}) para pesquisar · 📖 ajuda.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
@@ -1333,7 +1176,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     will_open = data in (
         "act:open_interactive",
-        "act:open_4chan_live",
         "act:quick_search",
         "act:mode_find",
     )
@@ -1353,23 +1195,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await msg.reply_text("ℹ️ Nenhuma URL salva para atualizar.", parse_mode=ParseMode.HTML)
                 return
 
-            # --- Reload 4chan Yotsuba B thread ---
-            if data == "act:reload_4chan":
-                if not session.last_4chan:
-                    await query.answer("Nenhuma thread recente para atualizar.", show_alert=True)
-                    return
-                await query.answer("🔄 Atualizando thread do 4chan...")
-                board, tid = session.last_4chan
-                await capture_and_send_4chan(msg, session, board, tid)
-                return
-
-            # --- Open last URL or 4chan thread in live Interactive Mode ---
-            if data in ("act:open_interactive", "act:open_4chan_live"):
-                if data == "act:open_4chan_live" and session.last_4chan:
-                    b, t = session.last_4chan
-                    target_url = f"https://boards.4chan.org/{b}/thread/{t}"
-                else:
-                    target_url = session.last_url
+            # --- Open last URL in live Interactive Mode ---
+            if data == "act:open_interactive":
+                target_url = session.last_url
 
                 if not target_url:
                     await query.answer("Nenhuma URL disponível.", show_alert=True)
@@ -1419,6 +1247,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
             # --- Mode switches ---
+            if data == "act:toggle_click_type":
+                if session.mode == SessionMode.CLICK:
+                    if not session.has_open_page:
+                        await query.answer("Abra uma página primeiro.", show_alert=True)
+                        return
+                    await query.answer("⌨️ Modo Digitação")
+                    session.mode = SessionMode.TYPE
+                    await session.ensure_page()
+                    assert session.page is not None
+                    await session.page.focus_best_input()
+                    await render_and_show_interactive(
+                        msg,
+                        session,
+                        status_note="Modo Digitação — escreva no chat",
+                        edit_existing=True,
+                        callback_message=msg,
+                    )
+                else:
+                    await query.answer("🖱️ Modo Clique")
+                    session.mode = SessionMode.CLICK
+                    if session.has_open_page:
+                        await render_and_show_interactive(
+                            msg,
+                            session,
+                            status_note="Modo Clique",
+                            edit_existing=True,
+                            callback_message=msg,
+                        )
+                    else:
+                        await msg.reply_text(
+                            "🖱️ Modo Clique selecionado. Envie uma URL ou use /s para começar.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                return
+
             if data == "act:mode_click":
                 await query.answer("🖱️ Modo Clique ativado")
                 session.mode = SessionMode.CLICK
@@ -1432,7 +1295,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 else:
                     await msg.reply_text(
-                        "🖱️ Modo Clique selecionado. Envie uma URL ou use /pesquisar para começar.",
+                        "🖱️ Modo Clique selecionado. Envie uma URL ou use /s para começar.",
                         parse_mode=ParseMode.HTML,
                     )
                 return
@@ -1456,7 +1319,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
             if data == "act:mode_search":
-                await query.answer("🔍 Modo Pesquisa ativado")
+                await query.answer("🔍 Pesquisa Web")
                 session.mode = SessionMode.WEB_SEARCH
                 eng = SEARCH_ENGINES.get(session.search_engine, SEARCH_ENGINES["duckduckgo"])
                 if session.has_open_page and msg.photo:
@@ -1469,9 +1332,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 else:
                     await msg.reply_text(
-                        f"🔍 <b>Modo Interativo de Pesquisa ativado!</b>\n"
-                        f"Buscador atual: <b>{eng['emoji']} {eng['name']}</b>\n"
-                        "Escreva no chat o que deseja pesquisar:",
+                        _build_search_prompt_text(session.search_engine),
                         parse_mode=ParseMode.HTML,
                         reply_markup=build_search_prompt_keyboard(session.search_engine),
                     )
@@ -1479,12 +1340,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             if data == "act:mode_find":
                 if not session.has_open_page and session.last_url:
-                    await query.answer("🔎 Abrindo página para busca...")
+                    await query.answer("🔦 Abrindo página...")
                     await session.navigate(session.last_url)
                 if not session.has_open_page:
                     await query.answer("Abra uma página primeiro.", show_alert=True)
                     return
-                await query.answer("🔎 Digite no chat o termo para buscar na página")
+                await query.answer("🔦 Busca na página")
                 session.mode = SessionMode.PAGE_FIND
                 if msg.photo:
                     await render_and_show_interactive(
@@ -1496,7 +1357,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 else:
                     await msg.reply_text(
-                        "🔎 <b>Pesquisa na Página ativa!</b>\nEscreva no chat o termo que deseja encontrar.",
+                        "🔦 <b>Busca na Página</b>\nEscreva no chat o termo que deseja encontrar.",
                         parse_mode=ParseMode.HTML,
                     )
                 return
@@ -1509,7 +1370,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     meta = SEARCH_ENGINES[eng_key]
                     # If user already ran a search and has a live page, re-run on new engine!
                     if session.last_search_query and session.has_open_page and msg.photo:
-                        await query.answer(f"Pesquisando no {meta['name']}...")
+                        await query.answer(f"{meta['emoji']} {meta['name']}...")
                         url, _ = build_search_url(session.last_search_query, eng_key)
                         await session.navigate(url)
                         session.mode = SessionMode.CLICK
@@ -1521,20 +1382,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             callback_message=msg,
                         )
                     else:
-                        await query.answer(f"Buscador alterado para {meta['name']}")
+                        await query.answer(f"{meta['emoji']} {meta['name']}")
                         if msg.photo and session.has_open_page:
                             await render_and_show_interactive(
                                 msg,
                                 session,
-                                status_note=f"Buscador: {meta['emoji']} {meta['name']} — digite sua busca!",
+                                status_note=f"{meta['emoji']} {meta['name']} — digite sua busca!",
                                 edit_existing=True,
                                 callback_message=msg,
                             )
                         else:
                             await msg.edit_text(
-                                f"🔍 <b>Modo Interativo de Pesquisa ativado!</b>\n"
-                                f"Buscador atual: <b>{meta['emoji']} {meta['name']}</b>\n"
-                                "Escreva no chat o que deseja pesquisar:",
+                                _build_search_prompt_text(session.search_engine),
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=build_search_prompt_keyboard(session.search_engine),
                             )
@@ -1784,16 +1643,16 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler(["help", "ajuda"], help_command))
     app.add_handler(CommandHandler("png", png_command))
-    app.add_handler(CommandHandler(["interativo", "abrir", "browse", "navegar"], interactive_command))
-    app.add_handler(CommandHandler(["atualizar", "reload"], reload_command))
-    app.add_handler(CommandHandler(["pesquisar", "search", "buscar"], search_command))
-    app.add_handler(CommandHandler(["achar", "find"], find_command))
-    app.add_handler(CommandHandler(["clicar", "click"], click_command))
-    app.add_handler(CommandHandler(["digitar", "type"], type_command))
-    app.add_handler(CommandHandler(["voltar", "back"], back_command))
-    app.add_handler(CommandHandler(["avancar", "forward"], forward_command))
-    app.add_handler(CommandHandler(["rolar", "scroll"], scroll_command))
-    app.add_handler(CommandHandler(["fechar", "close", "sair"], close_command))
+    app.add_handler(CommandHandler("i", interactive_command))
+    app.add_handler(CommandHandler("u", reload_command))
+    app.add_handler(CommandHandler("s", search_command))
+    app.add_handler(CommandHandler("f", find_command))
+    app.add_handler(CommandHandler("c", click_command))
+    app.add_handler(CommandHandler("t", type_command))
+    app.add_handler(CommandHandler("b", back_command))
+    app.add_handler(CommandHandler("n", forward_command))
+    app.add_handler(CommandHandler("r", scroll_command))
+    app.add_handler(CommandHandler("exit", close_command))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

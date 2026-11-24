@@ -1922,7 +1922,7 @@ class CDPPage:
         return await self.get_url()
 
     async def set_content(self, html: str, wait_ms: int = 120) -> None:
-        """Loads raw HTML directly into the page (offline rendering, e.g. 4chan Yotsuba B template)."""
+        """Loads raw HTML directly into the page (offline HTML rendering)."""
         self._reset_load_signals(clear_inflight=True)
         tree = await self._send("Page.getFrameTree")
         frame_id = tree["frameTree"]["frame"]["id"]

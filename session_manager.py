@@ -118,7 +118,6 @@ class BrowserSession:
     badge_page: int = 0
     last_url: str = ""
     last_title: str = ""
-    last_4chan: Optional[Tuple[str, int]] = None  # (board, thread_id)
     last_search_query: str = ""
     find_query: str = ""
     find_index: int = 0
