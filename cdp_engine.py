@@ -43,6 +43,8 @@ DEFAULT_VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "900"))
 DEFAULT_DEVICE_SCALE_FACTOR = float(os.getenv("DEVICE_SCALE_FACTOR", "2.0"))
 DEFAULT_MAX_SLICE_HEIGHT_CSS = int(os.getenv("MAX_SLICE_HEIGHT_CSS", "14000"))
 DEFAULT_NAVIGATION_TIMEOUT = float(os.getenv("NAVIGATION_TIMEOUT", "30.0"))
+DEFAULT_PAGE_LOAD_SETTLE_TIMEOUT = float(os.getenv("PAGE_LOAD_SETTLE_TIMEOUT", "8.0"))
+DEFAULT_PAGE_LOAD_QUIET_MS = int(os.getenv("PAGE_LOAD_QUIET_MS", "500"))
 TELEGRAM_MAX_PNG_BYTES = 48 * 1024 * 1024  # 48 MB safety margin under Telegram's 50 MB limit
 
 DEFAULT_USER_AGENT = (
@@ -116,6 +118,21 @@ class ScrollInfo:
     percent: int
 
 
+@dataclass
+class PageLoadStatus:
+    """Diagnostic summary returned by the hybrid JS + CDP page-load completion detector."""
+
+    settled: bool
+    reason: str  # "settled", "timeout", "error"
+    ready_state: str = ""
+    elapsed_ms: int = 0
+    pending_js_requests: int = 0
+    pending_cdp_requests: int = 0
+    pending_images: int = 0
+    dom_mutations: int = 0
+    url: str = ""
+
+
 def find_browser_executable(base_dir: Optional[Path] = None) -> Tuple[str, bool]:
     """
     Locates the lightest available Chromium-compatible binary.
@@ -186,7 +203,8 @@ def find_browser_executable(base_dir: Optional[Path] = None) -> Tuple[str, bool]
     )
 
 
-# JavaScript injected on every new document to avoid webdriver flags & keep popups in the same tab
+# JavaScript injected on every new document to avoid webdriver flags, keep popups in the same tab,
+# and track page-loading activity (fetch/XHR, DOM mutations, SPA history changes, lifecycle events).
 _INIT_SCRIPT = r"""
 (() => {
     try {
@@ -204,7 +222,525 @@ _INIT_SCRIPT = r"""
             return origOpen ? origOpen.apply(this, arguments) : null;
         };
     } catch (_) {}
+
+    // Persistent in-page page-load & stability tracker
+    try {
+        if (window.__chanarcLoadTracker__) return;
+        const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+
+        const state = {
+            createdAt: now(),
+            lastNetworkTs: now(),
+            lastDomMutationTs: now(),
+            lastNavTs: now(),
+            domContentLoadedTs: 0,
+            loadTs: 0,
+            mutationCount: 0,
+            networkCount: 0,
+            activeRequests: new Map(), // id -> { startedAt, url }
+            _nextReqId: 1,
+            _observer: null,
+            _observedTarget: null,
+            activeRequestCount(staleMs = 4500) {
+                const t = now();
+                let count = 0;
+                for (const [id, info] of this.activeRequests.entries()) {
+                    if (t - info.startedAt > staleMs) {
+                        // Age out SSE / long-polling / stuck analytics requests
+                        this.activeRequests.delete(id);
+                    } else {
+                        count++;
+                    }
+                }
+                return count;
+            },
+            markDomMutation() {
+                this.lastDomMutationTs = now();
+                this.mutationCount++;
+            },
+            markNav() {
+                const t = now();
+                this.lastNavTs = t;
+                this.lastDomMutationTs = t;
+            },
+            ensureObserver() {
+                startObserver();
+            }
+        };
+
+        // 1. Track document lifecycle events
+        if (document.readyState === 'interactive' || document.readyState === 'complete') {
+            state.domContentLoadedTs = now();
+        }
+        if (document.readyState === 'complete') {
+            state.loadTs = now();
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            state.domContentLoadedTs = now();
+            state.markDomMutation();
+        }, { once: true });
+        window.addEventListener('load', () => {
+            const t = now();
+            state.loadTs = t;
+            state.lastNetworkTs = t;
+        }, { once: true });
+
+        // 2. Track fetch() in-flight requests transparently
+        if (typeof window.fetch === 'function') {
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                const id = state._nextReqId++;
+                const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+                const startedAt = now();
+                state.activeRequests.set(id, { startedAt, url: reqUrl });
+                state.lastNetworkTs = startedAt;
+                state.networkCount++;
+                const finish = () => {
+                    if (state.activeRequests.delete(id)) {
+                        state.lastNetworkTs = now();
+                    }
+                };
+                try {
+                    const promise = origFetch.apply(window, args);
+                    if (promise && typeof promise.then === 'function') {
+                        promise.then(finish, finish);
+                    } else {
+                        finish();
+                    }
+                    return promise;
+                } catch (err) {
+                    finish();
+                    throw err;
+                }
+            };
+        }
+
+        // 3. Track XMLHttpRequest in-flight requests transparently
+        if (typeof XMLHttpRequest !== 'undefined' && XMLHttpRequest.prototype) {
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                try {
+                    this.__chanarcUrl = typeof url === 'string' ? url : String(url || '');
+                } catch (_) {}
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                const id = state._nextReqId++;
+                const startedAt = now();
+                state.activeRequests.set(id, { startedAt, url: this.__chanarcUrl || '' });
+                state.lastNetworkTs = startedAt;
+                state.networkCount++;
+                const finish = () => {
+                    if (state.activeRequests.delete(id)) {
+                        state.lastNetworkTs = now();
+                    }
+                };
+                try {
+                    this.addEventListener('loadend', finish, { once: true });
+                    this.addEventListener('error', finish, { once: true });
+                    this.addEventListener('abort', finish, { once: true });
+                    this.addEventListener('timeout', finish, { once: true });
+                } catch (_) {}
+                try {
+                    return origSend.apply(this, arguments);
+                } catch (err) {
+                    finish();
+                    throw err;
+                }
+            };
+        }
+
+        // 4. Track SPA client-side history navigations
+        try {
+            const wrapHistory = (fnName) => {
+                const orig = history[fnName];
+                if (typeof orig !== 'function') return;
+                history[fnName] = function() {
+                    const res = orig.apply(this, arguments);
+                    state.markNav();
+                    return res;
+                };
+            };
+            wrapHistory('pushState');
+            wrapHistory('replaceState');
+            window.addEventListener('popstate', () => state.markNav(), true);
+            window.addEventListener('hashchange', () => state.markNav(), true);
+        } catch (_) {}
+
+        // 5. Track meaningful DOM mutations (ignoring our own overlays & continuous style animations)
+        const isOwnNode = (node) => {
+            if (!node || node.nodeType !== 1) return false;
+            const id = node.id || '';
+            if (id === '__chanarc_overlay_root__' || id === '__chanarc_find_style__') return true;
+            if (node.classList && node.classList.contains('__chanarc_find_mark__')) return true;
+            if (node.closest && node.closest('#__chanarc_overlay_root__')) return true;
+            return false;
+        };
+
+        const startObserver = () => {
+            const target = document.documentElement || document;
+            if (!target || typeof MutationObserver === 'undefined') return;
+            if (state._observedTarget === target && state._observer) return;
+            if (state._observer) {
+                try { state._observer.disconnect(); } catch (_) {}
+                state._observer = null;
+            }
+            try {
+                const mo = new MutationObserver((records) => {
+                    for (let i = 0; i < records.length; i++) {
+                        const r = records[i];
+                        if (isOwnNode(r.target)) continue;
+                        if (r.type === 'childList') {
+                            let meaningful = false;
+                            for (const n of r.addedNodes) {
+                                if (isOwnNode(n)) continue;
+                                if (n.nodeType === 1 || (n.nodeType === 3 && (n.nodeValue || '').trim().length > 0)) {
+                                    meaningful = true;
+                                    break;
+                                }
+                            }
+                            if (!meaningful) {
+                                for (const n of r.removedNodes) {
+                                    if (isOwnNode(n)) continue;
+                                    if (n.nodeType === 1) {
+                                        meaningful = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (meaningful) {
+                                state.markDomMutation();
+                                return;
+                            }
+                        } else if (r.type === 'attributes') {
+                            state.markDomMutation();
+                            return;
+                        }
+                    }
+                });
+                mo.observe(target, {
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['src', 'srcset', 'data-src', 'aria-busy', 'hidden']
+                });
+                state._observer = mo;
+                state._observedTarget = target;
+            } catch (_) {
+                state._observer = null;
+                state._observedTarget = null;
+            }
+        };
+
+        if (document.documentElement) {
+            startObserver();
+        } else {
+            document.addEventListener('DOMContentLoaded', startObserver, { once: true });
+            document.addEventListener('readystatechange', startObserver);
+        }
+
+        Object.defineProperty(window, '__chanarcLoadTracker__', {
+            value: state,
+            writable: false,
+            enumerable: false,
+            configurable: false
+        });
+    } catch (_) {}
 })();
+"""
+
+# Async JavaScript detector that waits until the page has truly finished loading:
+# readyState === 'complete', fetch/XHR & ResourceTiming quiet, DOM mutations & layout height stable,
+# visible loading indicators cleared, relevant images loaded & decoded, web fonts ready, and 2 paint frames.
+_WAIT_PAGE_LOAD_JS = r"""
+(async (opts) => {
+    const quietMs = Math.max(80, Number(opts.quietMs ?? 500));
+    const maxWaitMs = Math.max(quietMs + 200, Number(opts.maxWaitMs ?? 8000));
+    const imgTimeoutMs = Math.max(0, Number(opts.imgTimeoutMs ?? 3000));
+    const fontTimeoutMs = Math.max(0, Number(opts.fontTimeoutMs ?? 1500));
+    const checkAllImages = Boolean(opts.checkAllImages);
+    const waitWindowLoad = opts.waitWindowLoad !== false;
+    const minWaitMs = Math.max(0, Number(opts.minWaitMs ?? 0));
+
+    const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+    const startTs = now();
+    const deadline = startTs + maxWaitMs;
+    const remaining = () => Math.max(0, deadline - now());
+    const sleep = (ms) => new Promise(r => setTimeout(r, Math.max(0, ms)));
+
+    const tracker = window.__chanarcLoadTracker__ || null;
+    if (tracker && typeof tracker.ensureObserver === 'function') {
+        try { tracker.ensureObserver(); } catch (_) {}
+    }
+    const initialMutations = tracker ? tracker.mutationCount : 0;
+
+    // Fallback local MutationObserver if the document predated _INIT_SCRIPT
+    let localLastMutationTs = tracker ? tracker.lastDomMutationTs : startTs;
+    let localMutationCount = 0;
+    let localObserver = null;
+
+    if (!tracker && typeof MutationObserver !== 'undefined' && document.documentElement) {
+        try {
+            localObserver = new MutationObserver((records) => {
+                for (const r of records) {
+                    if (r.target && r.target.nodeType === 1 && r.target.id === '__chanarc_overlay_root__') continue;
+                    localLastMutationTs = now();
+                    localMutationCount++;
+                    return;
+                }
+            });
+            localObserver.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['src', 'srcset', 'data-src', 'aria-busy', 'hidden']
+            });
+        } catch (_) {}
+    }
+
+    const cleanup = () => {
+        if (localObserver) {
+            try { localObserver.disconnect(); } catch (_) {}
+            localObserver = null;
+        }
+    };
+
+    const getLastResourceEndTs = () => {
+        try {
+            if (typeof performance === 'undefined' || !performance.getEntriesByType) return 0;
+            const entries = performance.getEntriesByType('resource');
+            let maxEnd = 0;
+            for (let i = entries.length - 1; i >= Math.max(0, entries.length - 40); i--) {
+                const e = entries[i];
+                if (!e || e.initiatorType === 'beacon') continue;
+                if (e.responseEnd && e.responseEnd > maxEnd) {
+                    maxEnd = e.responseEnd;
+                }
+            }
+            return maxEnd;
+        } catch (_) {
+            return 0;
+        }
+    };
+
+    const getRelevantImages = () => {
+        const allImgs = Array.from(document.images || []);
+        const vw = window.innerWidth || 1280;
+        const vh = window.innerHeight || 900;
+        const relevant = [];
+        for (const img of allImgs) {
+            const src = img.currentSrc || img.getAttribute('src') || '';
+            if (!src || src.startsWith('data:image/gif;base64,R0lGOD')) continue;
+            const attrW = parseInt(img.getAttribute('width') || '', 10);
+            const attrH = parseInt(img.getAttribute('height') || '', 10);
+            if ((attrW === 1 && attrH === 1) || (attrW === 0 && attrH === 0)) continue;
+            const cs = window.getComputedStyle(img);
+            if (!cs || cs.display === 'none' || cs.visibility === 'hidden') continue;
+            const rect = img.getBoundingClientRect();
+            if (checkAllImages) {
+                if (img.loading === 'lazy' && !img.complete && rect.width === 0 && rect.height === 0) continue;
+                relevant.push(img);
+            } else {
+                const nearViewport = rect.bottom >= -150 && rect.top <= vh + 150 && rect.right >= -150 && rect.left <= vw + 150;
+                const hasSizeOrUnloaded = (rect.width > 0 && rect.height > 0) || !img.complete;
+                if (nearViewport && hasSizeOrUnloaded) {
+                    relevant.push(img);
+                }
+            }
+        }
+        return relevant;
+    };
+
+    const hasVisibleLoader = () => {
+        try {
+            const vh = window.innerHeight || 900;
+            const vw = window.innerWidth || 1280;
+            const nodes = document.querySelectorAll('[aria-busy="true"], [role="progressbar"]:not([aria-valuenow])');
+            for (const el of nodes) {
+                if (el.closest('video, audio')) continue;
+                const cs = window.getComputedStyle(el);
+                if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width >= 4 && r.height >= 4 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw) {
+                    return true;
+                }
+            }
+        } catch (_) {}
+        return false;
+    };
+
+    const waitPaintFrames = () => new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+            if (!done) {
+                done = true;
+                resolve();
+            }
+        };
+        const timer = setTimeout(finish, 300);
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    clearTimeout(timer);
+                    finish();
+                });
+            });
+        } else {
+            clearTimeout(timer);
+            finish();
+        }
+    });
+
+    try {
+        // Phase 1: Wait for document.readyState === 'complete' when requested
+        if (waitWindowLoad && document.readyState !== 'complete') {
+            const loadBudget = Math.min(remaining(), Math.max(1500, maxWaitMs * 0.65));
+            if (loadBudget > 0) {
+                await new Promise((resolve) => {
+                    if (document.readyState === 'complete') return resolve();
+                    let finished = false;
+                    const done = () => {
+                        if (finished) return;
+                        finished = true;
+                        window.removeEventListener('load', done);
+                        document.removeEventListener('readystatechange', onState);
+                        clearTimeout(t);
+                        resolve();
+                    };
+                    const onState = () => {
+                        if (document.readyState === 'complete') done();
+                    };
+                    window.addEventListener('load', done, { once: true });
+                    document.addEventListener('readystatechange', onState);
+                    const t = setTimeout(done, loadBudget);
+                });
+            }
+        }
+
+        if (minWaitMs > 0) {
+            const leftMin = minWaitMs - (now() - startTs);
+            if (leftMin > 0) await sleep(Math.min(leftMin, remaining()));
+        }
+
+        // Phase 2: Wait for DOM, fetch/XHR, resources, layout height, images, and busy loaders to settle
+        let lastHeight = Math.max(
+            document.body ? document.body.scrollHeight : 0,
+            document.documentElement ? document.documentElement.scrollHeight : 0
+        );
+        let lastLayoutChangeTs = startTs;
+        let settled = false;
+        const loaderBudgetEnd = startTs + maxWaitMs * 0.75;
+        const imgDeadline = Math.min(deadline, startTs + imgTimeoutMs);
+
+        while (now() < deadline) {
+            const t = now();
+
+            const curHeight = Math.max(
+                document.body ? document.body.scrollHeight : 0,
+                document.documentElement ? document.documentElement.scrollHeight : 0
+            );
+            if (curHeight !== lastHeight) {
+                lastHeight = curHeight;
+                lastLayoutChangeTs = t;
+            }
+
+            const docReady = !waitWindowLoad
+                ? document.readyState !== 'loading'
+                : (document.readyState === 'complete' || (document.readyState === 'interactive' && t > loaderBudgetEnd));
+
+            const pendingReqs = tracker ? tracker.activeRequestCount(4500) : 0;
+            const lastNetTs = Math.max(
+                tracker ? tracker.lastNetworkTs : 0,
+                getLastResourceEndTs()
+            );
+            const lastMutTs = Math.max(
+                tracker ? tracker.lastDomMutationTs : localLastMutationTs,
+                tracker ? tracker.lastNavTs : 0,
+                lastLayoutChangeTs
+            );
+
+            const netQuiet = pendingReqs === 0 && (t - lastNetTs) >= quietMs;
+            const domQuiet = (t - lastMutTs) >= quietMs;
+            const loaderBlocking = t < loaderBudgetEnd && hasVisibleLoader();
+
+            let pendingImgs = 0;
+            if (imgTimeoutMs > 0 && t < imgDeadline) {
+                const imgs = getRelevantImages();
+                for (const img of imgs) {
+                    if (!img.complete) pendingImgs++;
+                }
+            }
+
+            if (docReady && netQuiet && domQuiet && !loaderBlocking && pendingImgs === 0) {
+                settled = true;
+                break;
+            }
+
+            await sleep(Math.min(80, remaining()));
+        }
+
+        // Phase 3: Decode completed relevant images so bitmaps are ready for capture (bounded)
+        if (imgTimeoutMs > 0 && remaining() > 100) {
+            const decodeBudget = Math.min(1200, remaining());
+            try {
+                const imgs = getRelevantImages();
+                const decodePromises = imgs.map((img) => {
+                    if (img.complete) {
+                        return typeof img.decode === 'function' ? img.decode().catch(() => {}) : Promise.resolve();
+                    }
+                    return new Promise((r) => {
+                        const done = () => r();
+                        img.addEventListener('load', done, { once: true });
+                        img.addEventListener('error', done, { once: true });
+                    });
+                });
+                if (decodePromises.length > 0) {
+                    await Promise.race([Promise.all(decodePromises), sleep(decodeBudget)]);
+                }
+            } catch (_) {}
+        }
+
+        // Phase 4: Wait for web fonts (bounded)
+        if (fontTimeoutMs > 0 && document.fonts && document.fonts.ready && remaining() > 80) {
+            try {
+                await Promise.race([document.fonts.ready, sleep(Math.min(fontTimeoutMs, remaining()))]);
+            } catch (_) {}
+        }
+
+        // Phase 5: Wait for browser paint commit (2 consecutive animation frames)
+        await waitPaintFrames();
+
+        const finalImgs = getRelevantImages().filter(img => !img.complete).length;
+        return {
+            settled,
+            reason: settled ? 'settled' : 'timeout',
+            readyState: document.readyState,
+            elapsedMs: Math.round(now() - startTs),
+            pendingJsRequests: tracker ? tracker.activeRequestCount(4500) : 0,
+            pendingImages: finalImgs,
+            domMutations: tracker ? (tracker.mutationCount - initialMutations) : localMutationCount,
+            url: window.location.href
+        };
+    } finally {
+        cleanup();
+    }
+})
+"""
+
+# Lightweight paint flush helper (2 animation frames with fallback timer)
+_WAIT_PAINT_FRAMES_JS = r"""
+new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(true); } };
+    const t = setTimeout(finish, 250);
+    if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); finish(); }));
+    } else {
+        clearTimeout(t);
+        finish();
+    }
+})
 """
 
 # JavaScript to annotate visible interactive elements with color-coded numbered badges
@@ -990,12 +1526,17 @@ class CDPPage:
         self.closed = False
 
         # Lifecycle & network quiet tracking
+        self._main_frame_id: Optional[str] = None
+        self._nav_generation: int = 0
         self._load_event = asyncio.Event()
         self._dom_event = asyncio.Event()
+        self._network_idle_event = asyncio.Event()
         self._frame_started_event = asyncio.Event()
-        self._inflight_requests: set[str] = set()
+        self._spa_nav_event = asyncio.Event()
+        self._inflight_requests: Dict[str, Tuple[float, str]] = {}
         self._last_network_activity: float = 0.0
         self._current_url: str = "about:blank"
+        self.last_load_status: Optional[PageLoadStatus] = None
 
         # Cache of last collected interactive elements
         self.elements: List[InteractiveElement] = []
@@ -1011,11 +1552,13 @@ class CDPPage:
         return await self.browser.send(method, params=params, session_id=self.session_id, timeout=timeout)
 
     async def _initialize(self) -> None:
-        """Enables core CDP domains, event tracking, stealth/popup script, and viewport metrics."""
+        """Enables core CDP domains, event tracking, stealth/load-tracker script, and viewport metrics."""
         self.browser.add_listener(self.session_id, "Page.loadEventFired", self._on_load_event)
         self.browser.add_listener(self.session_id, "Page.domContentEventFired", self._on_dom_event)
+        self.browser.add_listener(self.session_id, "Page.lifecycleEvent", self._on_lifecycle_event)
         self.browser.add_listener(self.session_id, "Page.frameStartedLoading", self._on_frame_started)
         self.browser.add_listener(self.session_id, "Page.frameNavigated", self._on_frame_navigated)
+        self.browser.add_listener(self.session_id, "Page.navigatedWithinDocument", self._on_navigated_within_document)
         self.browser.add_listener(self.session_id, "Network.requestWillBeSent", self._on_req_start)
         self.browser.add_listener(self.session_id, "Network.loadingFinished", self._on_req_end)
         self.browser.add_listener(self.session_id, "Network.loadingFailed", self._on_req_end)
@@ -1028,6 +1571,16 @@ class CDPPage:
             self._send("Network.enable"),
             self._send("DOM.enable"),
         )
+        try:
+            await self._send("Page.setLifecycleEventsEnabled", {"enabled": True})
+        except Exception:
+            pass
+        try:
+            tree = await self._send("Page.getFrameTree")
+            self._main_frame_id = tree.get("frameTree", {}).get("frame", {}).get("id")
+        except Exception:
+            pass
+
         await self._send(
             "Network.setUserAgentOverride",
             {
@@ -1039,30 +1592,79 @@ class CDPPage:
         await self._send("Page.addScriptToEvaluateOnNewDocument", {"source": _INIT_SCRIPT})
         await self.set_viewport(self.viewport_width, self.viewport_height, self.device_scale_factor)
 
+    def _reset_load_signals(self, clear_inflight: bool = False) -> None:
+        self._load_event.clear()
+        self._dom_event.clear()
+        self._network_idle_event.clear()
+        self._frame_started_event.clear()
+        self._spa_nav_event.clear()
+        if clear_inflight:
+            self._inflight_requests.clear()
+
+    def _active_cdp_request_count(self, stale_sec: float = 5.0) -> int:
+        """Returns number of non-stale blocking CDP network requests currently in flight."""
+        now = asyncio.get_running_loop().time()
+        stale_ids = [
+            req_id
+            for req_id, (started_at, _rtype) in self._inflight_requests.items()
+            if (now - started_at) > stale_sec
+        ]
+        for req_id in stale_ids:
+            self._inflight_requests.pop(req_id, None)
+        return len(self._inflight_requests)
+
     def _on_load_event(self, _params: Dict[str, Any]) -> None:
         self._load_event.set()
 
     def _on_dom_event(self, _params: Dict[str, Any]) -> None:
         self._dom_event.set()
 
-    def _on_frame_started(self, _params: Dict[str, Any]) -> None:
-        self._frame_started_event.set()
+    def _on_lifecycle_event(self, params: Dict[str, Any]) -> None:
+        if self._main_frame_id and params.get("frameId") != self._main_frame_id:
+            return
+        name = params.get("name", "")
+        if name == "networkIdle":
+            self._network_idle_event.set()
+        elif name == "load":
+            self._load_event.set()
+        elif name == "DOMContentLoaded":
+            self._dom_event.set()
+
+    def _on_frame_started(self, params: Dict[str, Any]) -> None:
+        frame_id = params.get("frameId")
+        if not self._main_frame_id or frame_id == self._main_frame_id:
+            self._nav_generation += 1
+            self._frame_started_event.set()
+            self._network_idle_event.clear()
 
     def _on_frame_navigated(self, params: Dict[str, Any]) -> None:
         frame = params.get("frame", {})
         if not frame.get("parentId"):
+            if frame.get("id"):
+                self._main_frame_id = frame["id"]
             self._current_url = frame.get("url", self._current_url)
+
+    def _on_navigated_within_document(self, params: Dict[str, Any]) -> None:
+        frame_id = params.get("frameId")
+        if not self._main_frame_id or frame_id == self._main_frame_id:
+            self._current_url = params.get("url", self._current_url)
+            self._spa_nav_event.set()
 
     def _on_req_start(self, params: Dict[str, Any]) -> None:
         req_id = params.get("requestId")
+        rtype = params.get("type", "")
+        if rtype in ("WebSocket", "EventSource", "Ping", "Beacon"):
+            return
         if req_id:
-            self._inflight_requests.add(req_id)
-            self._last_network_activity = asyncio.get_running_loop().time()
+            now = asyncio.get_running_loop().time()
+            self._inflight_requests[req_id] = (now, rtype)
+            self._last_network_activity = now
+            self._network_idle_event.clear()
 
     def _on_req_end(self, params: Dict[str, Any]) -> None:
         req_id = params.get("requestId")
         if req_id:
-            self._inflight_requests.discard(req_id)
+            self._inflight_requests.pop(req_id, None)
             self._last_network_activity = asyncio.get_running_loop().time()
 
     def _on_js_dialog(self, _params: Dict[str, Any]) -> None:
@@ -1130,34 +1732,174 @@ class CDPPage:
         except Exception:
             return ""
 
-    async def _wait_for_settle(self, quiet_ms: int = 450, max_wait: float = 3.5) -> None:
-        """Waits briefly for SPA rendering, web fonts, and primary network activity to settle."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max_wait
-        quiet_sec = quiet_ms / 1000.0
-        self._last_network_activity = loop.time()
+    async def wait_for_page_load(
+        self,
+        quiet_ms: int = DEFAULT_PAGE_LOAD_QUIET_MS,
+        max_wait: float = DEFAULT_PAGE_LOAD_SETTLE_TIMEOUT,
+        img_timeout_ms: int = 3000,
+        font_timeout_ms: int = 1500,
+        check_all_images: bool = False,
+        wait_window_load: bool = True,
+        min_wait_ms: int = 0,
+        wait_cdp_network: bool = True,
+    ) -> PageLoadStatus:
+        """
+        Hybrid JS + CDP page-load completion detector.
 
-        while loop.time() < deadline:
-            await asyncio.sleep(0.12)
-            idle_for = loop.time() - self._last_network_activity
-            if len(self._inflight_requests) <= 2 and idle_for >= quiet_sec:
+        Detects the true end of page loading by combining:
+        - In-page JS monitoring (`_WAIT_PAGE_LOAD_JS` + `_INIT_SCRIPT` tracker):
+          `document.readyState === 'complete'`, in-flight `fetch()`/`XMLHttpRequest`,
+          `PerformanceResourceTiming`, `MutationObserver` DOM quietness, layout height
+          stability, visible `aria-busy`/indeterminate progress loaders, relevant `<img>`
+          load + bitmap decoding, `document.fonts.ready`, and 2 animation paint frames.
+        - Native CDP tracking: `Page.lifecycleEvent` (`networkIdle`), main-frame redirect
+          recovery (re-runs automatically if a JS/meta redirect destroys the context mid-wait),
+          and non-stale in-flight CDP network requests (catches iframes, CSS assets, full bodies).
+        """
+        loop = asyncio.get_running_loop()
+        start_t = loop.time()
+        deadline = start_t + max(0.3, max_wait)
+        quiet_sec = max(0.08, quiet_ms / 1000.0)
+        cur_wait_window_load = wait_window_load
+        last_result: Optional[Dict[str, Any]] = None
+
+        for attempt in range(4):
+            rem = deadline - loop.time()
+            if rem <= 0.08:
                 break
 
-        # Best-effort wait for fonts without hanging
-        try:
-            await self.evaluate(
-                "Promise.race([document.fonts ? document.fonts.ready : Promise.resolve(), new Promise(r => setTimeout(r, 1200))])",
-                await_promise=True,
-                timeout=2.5,
+            nav_gen = self._nav_generation
+            js_opts = {
+                "quietMs": int(quiet_ms),
+                "maxWaitMs": int(max(300, rem * 1000)),
+                "imgTimeoutMs": int(min(img_timeout_ms, rem * 1000)),
+                "fontTimeoutMs": int(min(font_timeout_ms, rem * 1000)),
+                "checkAllImages": bool(check_all_images),
+                "waitWindowLoad": bool(cur_wait_window_load),
+                "minWaitMs": int(min_wait_ms if attempt == 0 else 0),
+            }
+            js_expr = f"({_WAIT_PAGE_LOAD_JS})({json.dumps(js_opts)})"
+
+            try:
+                res = await self.evaluate(js_expr, await_promise=True, timeout=rem + 3.0)
+                if isinstance(res, dict):
+                    last_result = res
+            except CDPError as exc:
+                err_msg = str(exc).lower()
+                nav_destroyed = (
+                    "execution context was destroyed" in err_msg
+                    or "cannot find context" in err_msg
+                    or "inspected target navigated" in err_msg
+                    or self._nav_generation != nav_gen
+                )
+                if nav_destroyed and attempt < 3:
+                    logger.debug(
+                        f"Page navigated/redirected while awaiting load (attempt {attempt + 1}); "
+                        "waiting for new document..."
+                    )
+                    rem_after = deadline - loop.time()
+                    if rem_after > 0.2:
+                        try:
+                            await asyncio.wait_for(self._load_event.wait(), timeout=min(rem_after, 6.0))
+                        except asyncio.TimeoutError:
+                            pass
+                    cur_wait_window_load = True
+                    continue
+                logger.debug(f"JS page-load detector error: {exc}")
+                status = PageLoadStatus(
+                    settled=False,
+                    reason="error",
+                    elapsed_ms=int((loop.time() - start_t) * 1000),
+                    pending_cdp_requests=self._active_cdp_request_count(),
+                    url=self._current_url,
+                )
+                self.last_load_status = status
+                return status
+            except Exception as exc:
+                logger.debug(f"Unexpected page-load detector error: {exc}")
+                break
+
+            # If a main-frame redirect started while JS was running, wait for the new document too
+            if self._nav_generation != nav_gen and attempt < 3:
+                rem_after = deadline - loop.time()
+                if rem_after > 0.2:
+                    try:
+                        await asyncio.wait_for(self._load_event.wait(), timeout=min(rem_after, 6.0))
+                    except asyncio.TimeoutError:
+                        pass
+                    cur_wait_window_load = True
+                    continue
+
+            # Cross-check with CDP network layer (catches cross-origin iframes, CSS bg images, streaming bodies)
+            if wait_cdp_network and self._active_cdp_request_count() > 0:
+                cdp_wait_end = min(deadline, loop.time() + 2.0)
+                waited_cdp = False
+                while loop.time() < cdp_wait_end:
+                    if self._network_idle_event.is_set():
+                        break
+                    idle_for = loop.time() - self._last_network_activity
+                    if self._active_cdp_request_count() == 0 and idle_for >= min(quiet_sec, 0.35):
+                        break
+                    waited_cdp = True
+                    await asyncio.sleep(0.08)
+                # Flush 2 paint frames if late CDP resources finished downloading
+                if waited_cdp and (deadline - loop.time()) > 0.1:
+                    try:
+                        await self.evaluate(_WAIT_PAINT_FRAMES_JS, await_promise=True, timeout=1.5)
+                    except Exception:
+                        pass
+
+            break
+
+        pending_cdp = self._active_cdp_request_count()
+        elapsed_ms = int((loop.time() - start_t) * 1000)
+        if last_result:
+            if isinstance(last_result.get("url"), str) and last_result["url"]:
+                self._current_url = last_result["url"]
+            status = PageLoadStatus(
+                settled=bool(last_result.get("settled", False)) and pending_cdp <= 1,
+                reason=str(last_result.get("reason", "timeout")),
+                ready_state=str(last_result.get("readyState", "")),
+                elapsed_ms=elapsed_ms,
+                pending_js_requests=int(last_result.get("pendingJsRequests", 0)),
+                pending_cdp_requests=pending_cdp,
+                pending_images=int(last_result.get("pendingImages", 0)),
+                dom_mutations=int(last_result.get("domMutations", 0)),
+                url=self._current_url,
             )
-        except Exception:
-            pass
+        else:
+            status = PageLoadStatus(
+                settled=False,
+                reason="timeout",
+                elapsed_ms=elapsed_ms,
+                pending_cdp_requests=pending_cdp,
+                url=self._current_url,
+            )
+
+        self.last_load_status = status
+        logger.debug(
+            f"Page load detection [{status.reason}] in {status.elapsed_ms}ms "
+            f"(readyState={status.ready_state}, mutations={status.dom_mutations}, "
+            f"js_req={status.pending_js_requests}, cdp_req={status.pending_cdp_requests}, "
+            f"imgs={status.pending_images}) url={status.url}"
+        )
+        return status
+
+    async def _wait_for_settle(
+        self,
+        quiet_ms: int = DEFAULT_PAGE_LOAD_QUIET_MS,
+        max_wait: float = DEFAULT_PAGE_LOAD_SETTLE_TIMEOUT,
+    ) -> PageLoadStatus:
+        """Backwards-compatible wrapper around `wait_for_page_load` for SPA/DOM/network settling."""
+        return await self.wait_for_page_load(
+            quiet_ms=quiet_ms,
+            max_wait=max_wait,
+            wait_window_load=False,
+        )
 
     async def goto(self, url: str, timeout: float = DEFAULT_NAVIGATION_TIMEOUT) -> str:
-        """Navigates to an HTTP(S) URL and waits for page load + SPA settle."""
-        self._load_event.clear()
-        self._dom_event.clear()
-        self._inflight_requests.clear()
+        """Navigates to an HTTP(S) URL and waits until the page has completely finished loading."""
+        self._reset_load_signals(clear_inflight=True)
         self.elements = []
 
         nav_res = await self._send("Page.navigate", {"url": url}, timeout=timeout)
@@ -1172,39 +1914,33 @@ class CDPPage:
                 raise NavigationError(f"Tempo limite ({int(timeout)}s) excedido ao carregar {url}.")
             logger.info(f"Page.loadEventFired timed out for {url}, continuing after DOMContentLoaded.")
 
-        await self._wait_for_settle(quiet_ms=450, max_wait=3.5)
+        await self.wait_for_page_load(
+            quiet_ms=DEFAULT_PAGE_LOAD_QUIET_MS,
+            max_wait=DEFAULT_PAGE_LOAD_SETTLE_TIMEOUT,
+            wait_window_load=True,
+        )
         return await self.get_url()
 
     async def set_content(self, html: str, wait_ms: int = 120) -> None:
         """Loads raw HTML directly into the page (offline rendering, e.g. 4chan Yotsuba B template)."""
-        self._load_event.clear()
-        self._dom_event.clear()
+        self._reset_load_signals(clear_inflight=True)
         tree = await self._send("Page.getFrameTree")
         frame_id = tree["frameTree"]["frame"]["id"]
+        self._main_frame_id = frame_id
         await self._send("Page.setDocumentContent", {"frameId": frame_id, "html": html})
-        if wait_ms > 0:
-            await asyncio.sleep(wait_ms / 1000.0)
-        # Ensure all inline images have finished decoding
-        try:
-            await self.evaluate(
-                """(async () => {
-                    const imgs = Array.from(document.images || []);
-                    await Promise.all(imgs.map(img => img.complete ? Promise.resolve() : new Promise(r => {
-                        img.onload = img.onerror = r;
-                        setTimeout(r, 1500);
-                    })));
-                })()""",
-                await_promise=True,
-                timeout=5.0,
-            )
-        except Exception:
-            pass
+        await self.wait_for_page_load(
+            quiet_ms=max(80, wait_ms),
+            max_wait=5.0,
+            img_timeout_ms=3000,
+            font_timeout_ms=1500,
+            check_all_images=True,
+            wait_window_load=True,
+            wait_cdp_network=False,
+        )
 
     async def reload(self, ignore_cache: bool = True, timeout: float = DEFAULT_NAVIGATION_TIMEOUT) -> str:
-        """Reloads the current page and waits for it to settle."""
-        self._load_event.clear()
-        self._dom_event.clear()
-        self._inflight_requests.clear()
+        """Reloads the current page and waits for complete page load."""
+        self._reset_load_signals(clear_inflight=True)
         self.elements = []
         await self._send("Page.reload", {"ignoreCache": ignore_cache}, timeout=timeout)
         try:
@@ -1212,7 +1948,11 @@ class CDPPage:
         except asyncio.TimeoutError:
             if not self._dom_event.is_set():
                 logger.warning("Reload timed out before loadEventFired; returning current state.")
-        await self._wait_for_settle(quiet_ms=450, max_wait=3.5)
+        await self.wait_for_page_load(
+            quiet_ms=DEFAULT_PAGE_LOAD_QUIET_MS,
+            max_wait=DEFAULT_PAGE_LOAD_SETTLE_TIMEOUT,
+            wait_window_load=True,
+        )
         return await self.get_url()
 
     async def go_back(self) -> bool:
@@ -1223,15 +1963,14 @@ class CDPPage:
         if idx <= 0 or not entries:
             return False
         prev_entry = entries[idx - 1]
-        self._load_event.clear()
-        self._dom_event.clear()
+        self._reset_load_signals(clear_inflight=True)
         self.elements = []
         await self._send("Page.navigateToHistoryEntry", {"entryId": prev_entry["id"]})
         try:
             await asyncio.wait_for(self._load_event.wait(), timeout=15.0)
         except asyncio.TimeoutError:
             pass
-        await self._wait_for_settle(quiet_ms=350, max_wait=2.5)
+        await self.wait_for_page_load(quiet_ms=400, max_wait=5.0, wait_window_load=True)
         return True
 
     async def go_forward(self) -> bool:
@@ -1242,15 +1981,14 @@ class CDPPage:
         if idx + 1 >= len(entries):
             return False
         next_entry = entries[idx + 1]
-        self._load_event.clear()
-        self._dom_event.clear()
+        self._reset_load_signals(clear_inflight=True)
         self.elements = []
         await self._send("Page.navigateToHistoryEntry", {"entryId": next_entry["id"]})
         try:
             await asyncio.wait_for(self._load_event.wait(), timeout=15.0)
         except asyncio.TimeoutError:
             pass
-        await self._wait_for_settle(quiet_ms=350, max_wait=2.5)
+        await self.wait_for_page_load(quiet_ms=400, max_wait=5.0, wait_window_load=True)
         return True
 
     async def get_scroll_info(self) -> ScrollInfo:
@@ -1277,7 +2015,7 @@ class CDPPage:
         )
 
     async def scroll(self, direction: str = "down", fraction: float = 0.8) -> ScrollInfo:
-        """Scrolls the viewport up, down, top, or bottom."""
+        """Scrolls the viewport up, down, top, or bottom and waits for newly revealed content to settle."""
         if direction == "top":
             await self.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })", await_promise=False)
         elif direction == "bottom":
@@ -1290,32 +2028,46 @@ class CDPPage:
             if direction == "up":
                 delta = -delta
             await self.evaluate(f"window.scrollBy({{ top: {delta}, behavior: 'instant' }})", await_promise=False)
-        await asyncio.sleep(0.25)
+        await self.wait_for_page_load(
+            quiet_ms=250,
+            max_wait=1.8,
+            img_timeout_ms=1200,
+            font_timeout_ms=400,
+            check_all_images=False,
+            wait_window_load=False,
+            min_wait_ms=120,
+        )
         return await self.get_scroll_info()
 
     async def _hydrate_lazy_content(self, max_steps: int = 16) -> None:
         """
         Quickly steps through a live web page to trigger lazy-loaded images and
-        IntersectionObservers, then scrolls back to y=0 before full-page capture.
+        IntersectionObservers, scrolls back to y=0, and waits until all images/DOM settle.
         """
         try:
             scroll_height = await self.evaluate(
                 "Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)",
                 await_promise=False,
             )
-            if not scroll_height or scroll_height <= self.viewport_height:
-                return
+            if scroll_height and scroll_height > self.viewport_height:
+                # Limit total hydration scroll height so infinite-scroll feeds don't explode forever
+                max_hydrate_y = min(int(scroll_height), self.viewport_height * max_steps)
+                step = max(self.viewport_height - 100, 600)
+                y = step
+                while y < max_hydrate_y:
+                    await self.evaluate(f"window.scrollTo(0, {y})", await_promise=False)
+                    await asyncio.sleep(0.12)
+                    y += step
+                await self.evaluate("window.scrollTo(0, 0)", await_promise=False)
 
-            # Limit total hydration scroll height so infinite-scroll feeds don't explode forever
-            max_hydrate_y = min(int(scroll_height), self.viewport_height * max_steps)
-            step = max(self.viewport_height - 100, 600)
-            y = step
-            while y < max_hydrate_y:
-                await self.evaluate(f"window.scrollTo(0, {y})", await_promise=False)
-                await asyncio.sleep(0.12)
-                y += step
-            await self.evaluate("window.scrollTo(0, 0)", await_promise=False)
-            await self._wait_for_settle(quiet_ms=350, max_wait=2.0)
+            await self.wait_for_page_load(
+                quiet_ms=400,
+                max_wait=4.5,
+                img_timeout_ms=3000,
+                font_timeout_ms=1000,
+                check_all_images=True,
+                wait_window_load=False,
+            )
         except Exception as exc:
             logger.debug(f"Lazy-content hydration skipped: {exc}")
 
@@ -1578,26 +2330,45 @@ class CDPPage:
         )
 
     async def _settle_after_action(self, prev_url: str) -> bool:
-        """Waits briefly after a click or Enter press to let navigation or SPA updates finish."""
-        navigated = False
-        # Give JS / link navigation 350ms to kick off
+        """Waits after a click or Enter press for full navigation, SPA route change, or DOM/AJAX updates."""
+        frame_task = asyncio.create_task(self._frame_started_event.wait())
+        spa_task = asyncio.create_task(self._spa_nav_event.wait())
         try:
-            await asyncio.wait_for(self._frame_started_event.wait(), timeout=0.45)
-            navigated = True
-        except asyncio.TimeoutError:
-            pass
+            await asyncio.wait(
+                (frame_task, spa_task),
+                timeout=0.45,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (frame_task, spa_task):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+
+        navigated = self._frame_started_event.is_set()
+        spa_navigated = self._spa_nav_event.is_set()
 
         if navigated:
             try:
                 await asyncio.wait_for(self._load_event.wait(), timeout=18.0)
             except asyncio.TimeoutError:
                 pass
-            await self._wait_for_settle(quiet_ms=400, max_wait=3.0)
+            await self.wait_for_page_load(quiet_ms=450, max_wait=6.0, wait_window_load=True)
+        elif spa_navigated:
+            await self.wait_for_page_load(quiet_ms=450, max_wait=5.0, wait_window_load=False)
         else:
-            await self._wait_for_settle(quiet_ms=350, max_wait=1.5)
+            await self.wait_for_page_load(
+                quiet_ms=350,
+                max_wait=3.0,
+                img_timeout_ms=1500,
+                wait_window_load=False,
+            )
 
         new_url = await self.get_url()
-        return navigated or (new_url != prev_url)
+        return navigated or spa_navigated or (new_url != prev_url)
 
     async def click_element_by_id(self, element_id: int) -> ClickResult:
         """Clicks an element tagged with badge number `element_id`."""
@@ -1610,8 +2381,7 @@ class CDPPage:
 
         await self.clear_overlays()
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         # Re-read live coordinates & rewrite target="_blank" so links open in-tab
         coords = await self.evaluate(
@@ -1667,8 +2437,7 @@ class CDPPage:
         # 3. Search full page DOM for a clickable matching element and scroll it into view
         await self.clear_overlays()
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         found = await self.evaluate(
             f"""((q) => {{
@@ -1727,8 +2496,7 @@ class CDPPage:
         """Clicks the first element matching a CSS selector."""
         await self.clear_overlays()
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         found = await self.evaluate(
             f"""((sel) => {{
@@ -1773,8 +2541,7 @@ class CDPPage:
         """Clicks directly at viewport coordinates (x, y)."""
         await self.clear_overlays()
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         info = await self.evaluate(
             f"""(() => {{
@@ -1865,8 +2632,7 @@ class CDPPage:
             return False
 
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         base = {
             "key": key_def["key"],
@@ -1907,8 +2673,7 @@ class CDPPage:
             await self.clear_focused_input()
 
         prev_url = await self.get_url()
-        self._frame_started_event.clear()
-        self._load_event.clear()
+        self._reset_load_signals(clear_inflight=False)
 
         await self._send("Input.insertText", {"text": text})
         navigated = False
